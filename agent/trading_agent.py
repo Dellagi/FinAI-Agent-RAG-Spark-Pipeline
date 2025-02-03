@@ -1,4 +1,3 @@
-
 from typing import List, Dict, Any
 import openai
 import pandas as pd
@@ -12,6 +11,8 @@ from pyspark.sql.types import *
 from ..research.research_engine import ResearchEngine
 from ..memory.episodic_memory import EpisodicMemoryStore, Episode, MemoryType
 from ..streaming.market_data_streaming import MarketDataStream
+from ..retrieval.rag import ContextualRAGRetriever
+from ..config import Config
 
 class TradingAgent:
     def __init__(self, config: Config, spark: SparkSession):
@@ -21,92 +22,101 @@ class TradingAgent:
         self.memory_store = EpisodicMemoryStore(config)
         self.market_stream = MarketDataStream(config, spark)
         
+        # Initialize RAG system
+        self.rag_retriever = ContextualRAGRetriever(
+            config,
+            self.memory_store.collections[MemoryType.TRADING_DECISION]
+        )
+        
     async def analyze_trading_opportunity(self, symbol: str) -> Dict[str, Any]:
         """Analyze trading opportunity for a given symbol"""
-        # Gather research and context
-        research = await self.research_engine.gather_research(
-            query=f"{symbol} stock analysis financial report",
-            sources=["news", "academic", "financial"]
-        )
-        
-        # Get relevant memories with importance threshold
-        memories = await self.memory_store.search_memories(
-            query=f"Previous trading analysis and decisions for {symbol}",
-            memory_type=MemoryType.TRADING_DECISION,
-            min_importance=0.6
-        )
-        
-        # Process market data using Spark
-        market_df = self.spark.sql(f"""
-            SELECT *
-            FROM market_data
-            WHERE symbol = '{symbol}'
-            ORDER BY timestamp DESC
-            LIMIT 1000
-        """)
-        
-        # Calculate technical indicators
-        indicators = self._calculate_technical_indicators(market_df)
-        market_context = self._analyze_market_context(indicators)
-        
-        # Prepare context for LLM
-        analysis_context = self._prepare_analysis_context(
-            symbol=symbol,
-            research=research,
-            memories=memories,
-            indicators=indicators,
-            market_context=market_context
-        )
-        
-        # Get trading decision from LLM
-        decision = await self._get_trading_decision(analysis_context)
-        
-        # Create and store memory episode
-        episode = Episode(
-            content=json.dumps({
-                'symbol': symbol,
-                'analysis': analysis_context,
-                'decision': decision
-            }),
-            memory_type=MemoryType.TRADING_DECISION,
-            timestamp=datetime.now(),
-            metadata={
-                'symbol': symbol,
-                'action': decision['recommendation']
-            },
-            context={
-                'market_conditions': market_context,
-                'technical_indicators': indicators
-            },
-            emotions=decision.get('sentiment', [])
-        )
-        
-        await self.memory_store.add_memory(episode)
-        
-        # Store market context as separate memory if significant
-        if market_context['volatility_level'] == 'HIGH' or \
-           abs(float(market_context['trend_strength'])) > 0.7:
-            market_episode = Episode(
-                content=json.dumps(market_context),
-                memory_type=MemoryType.MARKET_EVENT,
+        try:
+            # Update RAG system with latest memories
+            await self.rag_retriever.update_from_chroma()
+            
+            # Gather research and context
+            research = await self.research_engine.gather_research(
+                query=f"{symbol} stock analysis financial report",
+                sources=["news", "academic", "financial"]
+            )
+            
+            # Get relevant memories with importance threshold and RAG
+            memories = await self.memory_store.search_memories(
+                query=f"Previous trading analysis and decisions for {symbol}",
+                memory_type=MemoryType.TRADING_DECISION,
+                min_importance=0.6
+            )
+            
+            # Get additional context from RAG system
+            rag_results = await self.rag_retriever.retrieve_with_context(
+                query=f"Recent trading patterns and market context for {symbol}",
+                symbol=symbol,
+                k=self.config.RAG_MAX_RESULTS
+            )
+            
+            # Process market data using Spark
+            market_df = self.spark.sql(f"""
+                SELECT *
+                FROM market_data
+                WHERE symbol = '{symbol}'
+                ORDER BY timestamp DESC
+                LIMIT 1000
+            """)
+            
+            # Calculate technical indicators
+            indicators = self._calculate_technical_indicators(market_df)
+            market_context = self._analyze_market_context(indicators)
+            
+            # Prepare context for LLM with RAG insights
+            analysis_context = self._prepare_analysis_context(
+                symbol=symbol,
+                research=research,
+                memories=memories,
+                indicators=indicators,
+                market_context=market_context,
+                rag_results=rag_results
+            )
+            
+            # Get trading decision from LLM
+            decision = await self._get_trading_decision(analysis_context)
+            
+            # Create and store memory episode
+            episode = Episode(
+                content=json.dumps({
+                    'symbol': symbol,
+                    'analysis': analysis_context,
+                    'decision': decision,
+                    'rag_insights': rag_results
+                }),
+                memory_type=MemoryType.TRADING_DECISION,
                 timestamp=datetime.now(),
                 metadata={
                     'symbol': symbol,
-                    'event_type': 'market_context'
+                    'action': decision['recommendation']
                 },
-                importance=0.8 if market_context['volatility_level'] == 'HIGH' else 0.6
+                context={
+                    'market_conditions': market_context,
+                    'technical_indicators': indicators
+                },
+                emotions=decision.get('sentiment', [])
             )
-            await self.memory_store.add_memory(market_episode)
-        
-        return {
-            'symbol': symbol,
-            'research': research,
-            'technical_analysis': indicators,
-            'market_context': market_context,
-            'decision': decision,
-            'timestamp': datetime.now().isoformat()
-        }
-        
+            
+            await self.memory_store.add_memory(episode)
+            
+            return {
+                'symbol': symbol,
+                'research': research,
+                'technical_analysis': indicators,
+                'market_context': market_context,
+                'rag_insights': rag_results,
+                'decision': decision,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error analyzing trading opportunity for {symbol}: {str(e)}")
+            raise
+            
     def _calculate_technical_indicators(self, df) -> Dict[str, Any]:
         """Calculate technical indicators using Spark"""
         df.createOrReplaceTempView("price_data")
@@ -208,12 +218,13 @@ class TradingAgent:
         return context
         
     def _prepare_analysis_context(
-        self, 
+        self,
         symbol: str,
         research: Dict,
         memories: List[Episode],
         indicators: Dict[str, Any],
-        market_context: Dict[str, Any]
+        market_context: Dict[str, Any],
+        rag_results: Dict[str, Any]
     ) -> str:
         """Prepare context for LLM analysis"""
         context = f"""
@@ -233,6 +244,9 @@ class TradingAgent:
         - Volume Signal: {market_context['volume_signal']}
         - Price Momentum: {market_context['price_momentum']}
         
+        RAG System Insights:
+        {self._format_rag_results(rag_results)}
+        
         Recent Research:
         News:
         {self._format_research_items(research.get('news', []))}
@@ -251,6 +265,29 @@ class TradingAgent:
         - Market Conditions: {'Normal Trading Hours' if 9 <= datetime.now().hour <= 16 else 'Extended Hours'}
         """
         return context
+    
+    @staticmethod
+    def _format_rag_results(rag_results: Dict[str, Any]) -> str:
+        """Format RAG system results for context"""
+        formatted = []
+        
+        for result in rag_results.get('results', []):
+            relevance_score = result.get('relevance_score', 0)
+            reranking_score = result.get('reranking_score', 0)
+            
+            # Only include highly relevant results
+            if relevance_score >= 0.7 or reranking_score >= 0.7:
+                formatted.append(f"""
+                Insight:
+                {result['content'][:300]}...
+                Relevance: {relevance_score:.2f}
+                Reranking Score: {reranking_score:.2f}
+                """)
+                
+        if not formatted:
+            return "No highly relevant historical insights found."
+            
+        return "\n".join(formatted)
         
     async def _get_trading_decision(self, context: str) -> Dict[str, Any]:
         """Get trading decision from LLM"""
@@ -339,4 +376,3 @@ class TradingAgent:
             Importance: {memory.importance:.2f}
             """)
         return "\n".join(formatted)
-
