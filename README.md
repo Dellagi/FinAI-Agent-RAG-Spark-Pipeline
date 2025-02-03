@@ -49,7 +49,6 @@ A sophisticated trading system leveraging local LLM deployment through Ollama, d
 - **Reranking**: Cross-encoder (MiniLM)
 - **Distributed Computing**: Apache Spark
 - **Stream Processing**: Kafka
-- **Caching**: Redis
 - **Market Data**: Alpaca API
 - **Embeddings**: OpenAI Ada 002
 - **Text Processing**: NLTK, Transformers
