@@ -72,6 +72,8 @@ A sophisticated trading system leveraging local LLM deployment through Ollama, d
                                                └────────────────┘
 ```
 
+## 💡 Project status: In progress
+
 ## 💡 System Components
 
 ### RAG System
